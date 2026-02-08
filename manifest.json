@@ -1,0 +1,19 @@
+{
+  "name": "Poultry Pro — Lean Startup Toolkit",
+  "short_name": "Poultry Pro",
+  "description": "First-principles poultry management: flock tracking, feed formulation economics, and profitability analysis",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#1A1612",
+  "theme_color": "#1A1612",
+  "orientation": "any",
+  "scope": "./",
+  "icons": [
+    { "src": "icons/favicon-16.png", "sizes": "16x16", "type": "image/png" },
+    { "src": "icons/favicon-32.png", "sizes": "32x32", "type": "image/png" },
+    { "src": "icons/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ],
+  "categories": ["business", "finance", "productivity"]
+}
