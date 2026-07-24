@@ -20,6 +20,20 @@ const API = {
 const ELEVEN_BASE = 'https://api.elevenlabs.io/v1';
 const directMode = () => !!state.settings.apiKey;
 const directHeaders = () => ({ 'xi-api-key': state.settings.apiKey });
+
+// On-device neural voices (Kokoro, Apache-licensed). The model (~90MB)
+// downloads once, then synthesis runs locally: unlimited, offline, no credits.
+const KOKORO_CDN = 'https://cdn.jsdelivr.net/npm/kokoro-js@1.2.1/+esm';
+const KOKORO_MODEL = 'onnx-community/Kokoro-82M-v1.0-ONNX';
+const KOKORO_VOICES = [
+  { id: 'kokoro:af_heart',   name: 'Heart — US female (free, on-device)' },
+  { id: 'kokoro:af_bella',   name: 'Bella — US female (free, on-device)' },
+  { id: 'kokoro:am_michael', name: 'Michael — US male (free, on-device)' },
+  { id: 'kokoro:am_adam',    name: 'Adam — US male (free, on-device)' },
+  { id: 'kokoro:bf_emma',    name: 'Emma — UK female (free, on-device)' },
+  { id: 'kokoro:bm_george',  name: 'George — UK male (free, on-device)' },
+];
+const isKokoroVoice = (voiceId) => (voiceId || '').startsWith('kokoro:');
 const MAX_SEG_CHARS = 300;   // target characters per synthesis chunk
 const HARD_SPLIT_CHARS = 700; // force-split a single sentence longer than this
 
@@ -91,6 +105,7 @@ const state = {
   lastWordIdx: -1,
   urlCache: new Map(), // cacheKey -> objectURL (session only)
   synthInFlight: new Map(), // cacheKey -> Promise
+  kokoro: { tts: null, loading: null, queue: Promise.resolve() },
 };
 
 const audioEl = new Audio();
@@ -420,6 +435,75 @@ function buildWords(i, alignment) {
 }
 
 /* =========================================================================
+   On-device synthesis (Kokoro)
+   ========================================================================= */
+async function kokoroLoad() {
+  if (state.kokoro.tts) return state.kokoro.tts;
+  if (!state.kokoro.loading) {
+    state.kokoro.loading = (async () => {
+      setStatus('Loading voice engine…');
+      const mod = await import(KOKORO_CDN);
+      const device = ('gpu' in navigator) ? 'webgpu' : 'wasm';
+      const tts = await mod.KokoroTTS.from_pretrained(KOKORO_MODEL, {
+        dtype: device === 'webgpu' ? 'fp32' : 'q8',
+        device,
+        progress_callback: (p) => {
+          if (p.status === 'progress' && p.total && /\.onnx/.test(p.file || '')) {
+            setStatus(`Downloading voice model ${Math.round((p.loaded / p.total) * 100)}% (one time)`);
+          }
+        },
+      });
+      state.kokoro.tts = tts;
+      return tts;
+    })().catch((e) => {
+      state.kokoro.loading = null;
+      throw new Error('Could not load the on-device voice engine: ' + (e && e.message ? e.message : e));
+    });
+  }
+  return state.kokoro.loading;
+}
+
+// Serialize generations — the model can only run one synthesis at a time.
+function kokoroGenerate(text, voice) {
+  const run = async () => {
+    const tts = await kokoroLoad();
+    return tts.generate(text, { voice });
+  };
+  const p = state.kokoro.queue.then(run, run);
+  state.kokoro.queue = p.catch(() => {});
+  return p;
+}
+
+function wavBlob(float32, sampleRate) {
+  const len = float32.length;
+  const buf = new ArrayBuffer(44 + len * 2);
+  const dv = new DataView(buf);
+  const wstr = (off, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)); };
+  wstr(0, 'RIFF'); dv.setUint32(4, 36 + len * 2, true); wstr(8, 'WAVE');
+  wstr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, sampleRate, true); dv.setUint32(28, sampleRate * 2, true);
+  dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  wstr(36, 'data'); dv.setUint32(40, len * 2, true);
+  for (let i = 0; i < len; i++) {
+    const s = Math.max(-1, Math.min(1, float32[i]));
+    dv.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+// Kokoro gives no timestamps, so spread characters evenly across the clip.
+// Word highlighting stays close enough to feel synchronized.
+function estimateAlignment(text, durationSec) {
+  const chars = text.split('');
+  const per = durationSec / Math.max(1, chars.length);
+  return {
+    characters: chars,
+    character_start_times_seconds: chars.map((_, i) => i * per),
+    character_end_times_seconds: chars.map((_, i) => (i + 1) * per),
+  };
+}
+
+/* =========================================================================
    Synthesis + cache
    ========================================================================= */
 async function cacheKeyFor(text) {
@@ -443,6 +527,17 @@ async function ensureAudio(i) {
     let rec = await idbGet('audio', key);
     if (!rec) {
       const s = state.settings;
+      if (isKokoroVoice(s.voiceId)) {
+        const raw = await kokoroGenerate(seg.text, s.voiceId.slice('kokoro:'.length));
+        const samples = raw.audio;
+        const blob = wavBlob(samples, raw.sampling_rate);
+        const duration = samples.length / raw.sampling_rate;
+        rec = { key, blob, alignment: estimateAlignment(seg.text, duration), bytes: blob.size, createdAt: Date.now() };
+        await idbPut('audio', rec);
+        const url0 = URL.createObjectURL(rec.blob);
+        state.urlCache.set(key, url0);
+        return { url: url0, alignment: rec.alignment };
+      }
       const voiceSettings = {
         stability: s.stability,
         similarity_boost: s.similarity,
@@ -549,9 +644,11 @@ async function loadSegment(i, autoplay) {
 }
 
 async function prefetchNext(i) {
-  const n = i + 1;
-  if (n >= state.doc.segments.length) return;
-  ensureAudio(n).catch(() => {}); // best-effort warm cache
+  // On-device generation is slower than the API, so stay further ahead.
+  const ahead = isKokoroVoice(state.settings.voiceId) ? 3 : 1;
+  for (let n = i + 1; n <= i + ahead && n < state.doc.segments.length; n++) {
+    ensureAudio(n).catch(() => {}); // best-effort warm cache
+  }
 }
 
 function setPlaying(v) {
@@ -625,6 +722,47 @@ function saveProgress(i) {
 /* =========================================================================
    Voices + credits
    ========================================================================= */
+function populateVoiceSelect(elevenStatus) {
+  el.voiceSelect.innerHTML = '';
+
+  const freeGroup = document.createElement('optgroup');
+  freeGroup.label = 'Free · unlimited (on-device)';
+  for (const v of KOKORO_VOICES) {
+    const opt = document.createElement('option');
+    opt.value = v.id;
+    opt.textContent = v.name;
+    freeGroup.appendChild(opt);
+  }
+  el.voiceSelect.appendChild(freeGroup);
+
+  const elevenGroup = document.createElement('optgroup');
+  elevenGroup.label = 'ElevenLabs · uses credits';
+  if (state.voices.length) {
+    for (const v of state.voices) {
+      const opt = document.createElement('option');
+      opt.value = v.voice_id;
+      const desc = v.labels && (v.labels.accent || v.labels.description);
+      opt.textContent = desc ? `${v.name} · ${desc}` : v.name;
+      elevenGroup.appendChild(opt);
+    }
+  } else {
+    const opt = document.createElement('option');
+    opt.disabled = true;
+    opt.textContent = elevenStatus || 'Unavailable — add your API key in Settings';
+    elevenGroup.appendChild(opt);
+  }
+  el.voiceSelect.appendChild(elevenGroup);
+
+  // Default to a free voice; recover if the saved voice no longer exists.
+  if (!state.settings.voiceId) state.settings.voiceId = KOKORO_VOICES[0].id;
+  el.voiceSelect.value = state.settings.voiceId;
+  if (el.voiceSelect.value !== state.settings.voiceId) {
+    state.settings.voiceId = KOKORO_VOICES[0].id;
+    el.voiceSelect.value = state.settings.voiceId;
+  }
+  saveSettings();
+}
+
 async function loadVoices() {
   try {
     const res = directMode()
@@ -632,7 +770,8 @@ async function loadVoices() {
       : await fetch(API.voices);
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
-      el.voiceSelect.innerHTML = '<option>Voices unavailable</option>';
+      state.voices = [];
+      populateVoiceSelect('Unavailable — check your API key in Settings');
       toast(describeError(res.status, j), 5000);
       return;
     }
@@ -642,19 +781,10 @@ async function loadVoices() {
       name: v.name,
       labels: v.labels || {},
     }));
-    el.voiceSelect.innerHTML = '';
-    for (const v of state.voices) {
-      const opt = document.createElement('option');
-      opt.value = v.voice_id;
-      const desc = v.labels && (v.labels.accent || v.labels.description);
-      opt.textContent = desc ? `${v.name} · ${desc}` : v.name;
-      el.voiceSelect.appendChild(opt);
-    }
-    if (!state.settings.voiceId && state.voices[0]) state.settings.voiceId = state.voices[0].voice_id;
-    if (state.settings.voiceId) el.voiceSelect.value = state.settings.voiceId;
-    saveSettings();
+    populateVoiceSelect();
   } catch {
-    el.voiceSelect.innerHTML = '<option>Offline</option>';
+    state.voices = [];
+    populateVoiceSelect('Offline — free voices still work');
   }
 }
 
