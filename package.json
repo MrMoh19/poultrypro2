@@ -1,0 +1,13 @@
+{
+  "name": "speechify-personal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Personal text-to-speech reader with ElevenLabs neural voices (PWA + Netlify functions).",
+  "scripts": {
+    "dev": "netlify dev",
+    "deploy": "netlify deploy --prod"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

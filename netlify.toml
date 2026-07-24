@@ -1,0 +1,26 @@
+# Netlify configuration for Speechify Personal.
+# Static site at the repo root, serverless functions under netlify/functions.
+
+[build]
+  publish = "."
+  functions = "netlify/functions"
+
+# Friendly API paths -> serverless functions.
+[[redirects]]
+  from = "/api/tts"
+  to = "/.netlify/functions/tts"
+  status = 200
+
+[[redirects]]
+  from = "/api/voices"
+  to = "/.netlify/functions/voices"
+  status = 200
+
+[[redirects]]
+  from = "/api/subscription"
+  to = "/.netlify/functions/subscription"
+  status = 200
+
+[functions]
+  # Node 18+ gives us global fetch.
+  node_bundler = "esbuild"
