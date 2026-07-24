@@ -121,6 +121,12 @@
       </div>
 
       <div class="setting">
+        <label for="apiKeyInput">ElevenLabs API key</label>
+        <input type="password" id="apiKeyInput" class="key-input" placeholder="sk_…" autocomplete="off" />
+        <p class="hint">Paste your key here to connect this device directly to ElevenLabs. It is stored only in this browser — it never leaves your device except to talk to ElevenLabs. Voices load immediately after saving.</p>
+      </div>
+
+      <div class="setting">
         <label for="modelSelect">Voice model</label>
         <select id="modelSelect">
           <option value="eleven_flash_v2_5">Flash v2.5 — cheapest &amp; fastest</option>
@@ -148,7 +154,7 @@
       </div>
 
       <div class="setting">
-        <p class="hint">Your ElevenLabs key is stored as a secret on Netlify and never reaches this page. Documents and generated audio live only in this browser.</p>
+        <p class="hint">Documents and generated audio live only in this browser. If you set an API key above, it is stored on this device and used to talk to ElevenLabs directly; otherwise the app uses the key configured on Netlify.</p>
       </div>
     </div>
   </div>

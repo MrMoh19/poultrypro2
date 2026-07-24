@@ -14,6 +14,12 @@ const API = {
   voices: '/api/voices',
   subscription: '/api/subscription',
 };
+// Direct-to-ElevenLabs mode: used when the user saves an API key in Settings.
+// The key lives only in this browser (IndexedDB) and requests go straight to
+// ElevenLabs, bypassing the serverless functions entirely.
+const ELEVEN_BASE = 'https://api.elevenlabs.io/v1';
+const directMode = () => !!state.settings.apiKey;
+const directHeaders = () => ({ 'xi-api-key': state.settings.apiKey });
 const MAX_SEG_CHARS = 300;   // target characters per synthesis chunk
 const HARD_SPLIT_CHARS = 700; // force-split a single sentence longer than this
 
@@ -47,6 +53,7 @@ const el = {
   voiceSelect: $('voiceSelect'),
   speedSelect: $('speedSelect'),
   modelSelect: $('modelSelect'),
+  apiKeyInput: $('apiKeyInput'),
   fontSizeRange: $('fontSizeRange'),
   stabilityRange: $('stabilityRange'),
   similarityRange: $('similarityRange'),
@@ -67,6 +74,7 @@ const el = {
 const state = {
   settings: {
     theme: 'dark',
+    apiKey: '',
     voiceId: '',
     modelId: 'eleven_turbo_v2_5',
     speed: 1,
@@ -194,6 +202,7 @@ async function saveSettings() {
 function applySettingsToUI() {
   const s = state.settings;
   document.body.dataset.theme = s.theme;
+  el.apiKeyInput.value = s.apiKey;
   el.speedSelect.value = String(s.speed);
   el.modelSelect.value = s.modelId;
   el.fontSizeRange.value = s.fontSize;
@@ -434,29 +443,43 @@ async function ensureAudio(i) {
     let rec = await idbGet('audio', key);
     if (!rec) {
       const s = state.settings;
-      const res = await fetch(API.tts, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: seg.text,
-          voiceId: s.voiceId,
-          modelId: s.modelId,
-          voiceSettings: {
-            stability: s.stability,
-            similarity_boost: s.similarity,
-            style: 0,
-            use_speaker_boost: true,
-          },
-        }),
-      });
+      const voiceSettings = {
+        stability: s.stability,
+        similarity_boost: s.similarity,
+        style: 0,
+        use_speaker_boost: true,
+      };
+      let res;
+      if (directMode()) {
+        res = await fetch(
+          `${ELEVEN_BASE}/text-to-speech/${encodeURIComponent(s.voiceId)}/with-timestamps?output_format=mp3_44100_128`,
+          {
+            method: 'POST',
+            headers: { ...directHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: seg.text, model_id: s.modelId, voice_settings: voiceSettings }),
+          }
+        );
+      } else {
+        res = await fetch(API.tts, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: seg.text,
+            voiceId: s.voiceId,
+            modelId: s.modelId,
+            voiceSettings,
+          }),
+        });
+      }
       if (!res.ok) {
         let msg = 'Synthesis failed';
         try { const j = await res.json(); msg = describeError(res.status, j); } catch {}
         throw new Error(msg);
       }
       const data = await res.json();
+      const alignment = data.alignment || data.normalized_alignment || null;
       const blob = b64ToBlob(data.audio_base64);
-      rec = { key, blob, alignment: data.alignment, bytes: blob.size, createdAt: Date.now() };
+      rec = { key, blob, alignment, bytes: blob.size, createdAt: Date.now() };
       await idbPut('audio', rec);
       scheduleCreditsRefresh();
     }
@@ -472,7 +495,12 @@ async function ensureAudio(i) {
 
 function describeError(status, j) {
   const d = j && j.detail;
-  if (status === 401) return 'ElevenLabs rejected the API key. Check the ELEVENLABS_API_KEY on Netlify.';
+  if (status === 401) {
+    return directMode()
+      ? 'ElevenLabs rejected the API key — re-check the key in Settings.'
+      : 'ElevenLabs rejected the API key. Check the ELEVENLABS_API_KEY on Netlify.';
+  }
+  if (d && d.message) return d.message;
   if (status === 402 || (d && JSON.stringify(d).includes('quota'))) return 'Out of ElevenLabs credits for this month.';
   if (status === 500 && j.error === 'Server not configured') return 'Set ELEVENLABS_API_KEY in Netlify → Site settings → Environment variables.';
   if (d && d.detail && d.detail.message) return d.detail.message;
@@ -599,15 +627,21 @@ function saveProgress(i) {
    ========================================================================= */
 async function loadVoices() {
   try {
-    const res = await fetch(API.voices);
+    const res = directMode()
+      ? await fetch(`${ELEVEN_BASE}/voices`, { headers: directHeaders() })
+      : await fetch(API.voices);
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
       el.voiceSelect.innerHTML = '<option>Voices unavailable</option>';
       toast(describeError(res.status, j), 5000);
       return;
     }
-    const { voices } = await res.json();
-    state.voices = voices || [];
+    const data = await res.json();
+    state.voices = (data.voices || []).map((v) => ({
+      voice_id: v.voice_id,
+      name: v.name,
+      labels: v.labels || {},
+    }));
     el.voiceSelect.innerHTML = '';
     for (const v of state.voices) {
       const opt = document.createElement('option');
@@ -631,9 +665,19 @@ function scheduleCreditsRefresh() {
 }
 async function loadCredits() {
   try {
-    const res = await fetch(API.subscription);
-    if (!res.ok) throw new Error();
-    const d = await res.json();
+    let d;
+    if (directMode()) {
+      const res = await fetch(`${ELEVEN_BASE}/user/subscription`, { headers: directHeaders() });
+      if (!res.ok) throw new Error();
+      const raw = await res.json();
+      const used = raw.character_count || 0;
+      const limit = raw.character_limit || 0;
+      d = { used, limit, remaining: Math.max(0, limit - used) };
+    } else {
+      const res = await fetch(API.subscription);
+      if (!res.ok) throw new Error();
+      d = await res.json();
+    }
     const badge = el.creditsBadge;
     badge.classList.remove('err');
     el.creditsText.textContent = `${fmtCount(d.remaining)} credits left`;
@@ -752,6 +796,21 @@ function wireEvents() {
     saveSettings();
     onVoiceOrModelChange();
   });
+  el.apiKeyInput.addEventListener('change', () => {
+    state.settings.apiKey = el.apiKeyInput.value.trim();
+    el.apiKeyInput.value = state.settings.apiKey;
+    saveSettings();
+    if (state.settings.apiKey) {
+      toast('Key saved on this device — loading voices…');
+      loadVoices();
+      loadCredits();
+    } else {
+      toast('Key removed — using the server key if configured.');
+      loadVoices();
+      loadCredits();
+    }
+  });
+
   el.fontSizeRange.addEventListener('input', () => {
     state.settings.fontSize = parseInt(el.fontSizeRange.value, 10);
     document.documentElement.style.setProperty('--read-size', state.settings.fontSize + 'px');

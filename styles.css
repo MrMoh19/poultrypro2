@@ -237,6 +237,16 @@ select {
 .setting { padding: 16px 0; border-top: 1px solid var(--line); }
 .setting > label { display: block; font-weight: 600; font-size: 14px; margin-bottom: 8px; }
 .setting select, .setting input[type="range"] { width: 100%; max-width: none; }
+.key-input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 15px;
+  padding: 11px 13px;
+}
 .setting input[type="range"] { margin-bottom: 12px; }
 .hint { font-size: 12.5px; color: var(--muted); line-height: 1.5; margin: 8px 0 0; }
 .mono { font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 400; }
