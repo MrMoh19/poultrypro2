@@ -443,7 +443,11 @@ async function kokoroLoad() {
     state.kokoro.loading = (async () => {
       setStatus('Loading voice engine…');
       const mod = await import(KOKORO_CDN);
-      const device = ('gpu' in navigator) ? 'webgpu' : 'wasm';
+      // iOS Safari's WebGPU crashes the tab under this workload — use the
+      // stable WASM path with the compressed model there. WebGPU elsewhere.
+      const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent)
+        || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+      const device = (!isIOS && 'gpu' in navigator) ? 'webgpu' : 'wasm';
       const tts = await mod.KokoroTTS.from_pretrained(KOKORO_MODEL, {
         dtype: device === 'webgpu' ? 'fp32' : 'q8',
         device,
@@ -645,7 +649,7 @@ async function loadSegment(i, autoplay) {
 
 async function prefetchNext(i) {
   // On-device generation is slower than the API, so stay further ahead.
-  const ahead = isKokoroVoice(state.settings.voiceId) ? 3 : 1;
+  const ahead = isKokoroVoice(state.settings.voiceId) ? 2 : 1;
   for (let n = i + 1; n <= i + ahead && n < state.doc.segments.length; n++) {
     ensureAudio(n).catch(() => {}); // best-effort warm cache
   }

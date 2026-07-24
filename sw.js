@@ -2,7 +2,7 @@
 // Caches the static app shell for offline launch. Never intercepts API calls
 // (serverless functions) — those must always hit the network.
 
-const CACHE = 'speechify-personal-v3';
+const CACHE = 'speechify-personal-v4';
 const SHELL = [
   './',
   './index.html',
