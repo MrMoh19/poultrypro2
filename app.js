@@ -34,6 +34,10 @@ const KOKORO_VOICES = [
   { id: 'kokoro:bm_george',  name: 'George — UK male (free, on-device)' },
 ];
 const isKokoroVoice = (voiceId) => (voiceId || '').startsWith('kokoro:');
+
+// Device voices: the OS's built-in speech synthesis (Web Speech API).
+// Instant and unlimited on every platform; quality depends on the device.
+const isDeviceVoice = (voiceId) => (voiceId || '').startsWith('device:');
 const MAX_SEG_CHARS = 300;   // target characters per synthesis chunk
 const HARD_SPLIT_CHARS = 700; // force-split a single sentence longer than this
 
@@ -106,6 +110,8 @@ const state = {
   urlCache: new Map(), // cacheKey -> objectURL (session only)
   synthInFlight: new Map(), // cacheKey -> Promise
   kokoro: { tts: null, loading: null, queue: Promise.resolve() },
+  deviceVoices: [],
+  speechUtter: null,
 };
 
 const audioEl = new Audio();
@@ -608,12 +614,107 @@ function describeError(status, j) {
 }
 
 /* =========================================================================
+   Device-voice playback (Web Speech API)
+   ========================================================================= */
+function loadDeviceVoices() {
+  if (!('speechSynthesis' in window)) return;
+  const collect = () => {
+    const all = window.speechSynthesis.getVoices() || [];
+    if (!all.length) return;
+    let vs = all.filter((v) => /^en/i.test(v.lang));
+    if (!vs.length) vs = all;
+    // Enhanced/premium voices first — they sound noticeably better.
+    vs.sort((a, b) => {
+      const rank = (v) => (/premium|enhanced/i.test(v.name + v.voiceURI) ? 0 : 1);
+      return rank(a) - rank(b) || a.name.localeCompare(b.name);
+    });
+    state.deviceVoices = vs;
+    populateVoiceSelect();
+  };
+  collect();
+  window.speechSynthesis.onvoiceschanged = collect;
+}
+
+// Word spans with character ranges (no timings — boundary events drive these).
+function buildWordsPlain(i) {
+  const segEl = state.segEls[i];
+  const text = state.doc.segments[i].text;
+  if (!segEl) { state.words[i] = []; return; }
+  let html = '', last = 0, wi = 0;
+  const words = [];
+  const re = /\S+/g;
+  let m;
+  while ((m = re.exec(text))) {
+    html += escapeHtml(text.slice(last, m.index));
+    html += `<span class="w" data-w="${wi}">${escapeHtml(m[0])}</span>`;
+    words.push({ charStart: m.index, charEnd: m.index + m[0].length, el: null });
+    last = m.index + m[0].length;
+    wi++;
+  }
+  html += escapeHtml(text.slice(last)) + ' ';
+  segEl.innerHTML = html;
+  const nodes = segEl.querySelectorAll('.w');
+  words.forEach((w, k) => (w.el = nodes[k]));
+  state.words[i] = words;
+}
+
+function highlightWordAtChar(i, charIndex) {
+  const words = state.words[i];
+  if (!Array.isArray(words) || !words.length || !('charStart' in words[0])) return;
+  let idx = 0;
+  for (let k = 0; k < words.length; k++) {
+    if (words[k].charStart <= charIndex) idx = k; else break;
+  }
+  words.forEach((w, k) => {
+    if (!w.el) return;
+    w.el.classList.toggle('active', k === idx);
+    w.el.classList.toggle('spoken', k < idx);
+  });
+}
+
+function speakSegment(i, autoplay) {
+  if (!state.doc) return;
+  if (i < 0 || i >= state.doc.segments.length) { stopPlayback(); return; }
+  window.speechSynthesis.cancel();
+  clearWordHighlight();
+  state.currentIndex = i;
+  markActiveSegment(i);
+  const w = state.words[i];
+  if (!Array.isArray(w) || !w.length || !('charStart' in w[0])) buildWordsPlain(i);
+  setStatus(`Sentence ${i + 1} / ${state.doc.segments.length}`);
+  el.progressFill.style.width = ((i / state.doc.segments.length) * 100).toFixed(2) + '%';
+  saveProgress(i);
+  if (!autoplay) return;
+
+  const u = new SpeechSynthesisUtterance(state.doc.segments[i].text);
+  const uri = state.settings.voiceId.slice('device:'.length);
+  const v = state.deviceVoices.find((x) => x.voiceURI === uri);
+  if (v) u.voice = v;
+  u.rate = Math.min(2, Math.max(0.5, state.settings.speed));
+  u.onstart = () => setPlaying(true);
+  u.onboundary = (e) => {
+    if (state.speechUtter === u && typeof e.charIndex === 'number') highlightWordAtChar(i, e.charIndex);
+  };
+  u.onend = () => {
+    if (state.speechUtter !== u) return;
+    setPlaying(false);
+    if (i + 1 < state.doc.segments.length) speakSegment(i + 1, true);
+    else stopPlayback();
+  };
+  u.onerror = () => { if (state.speechUtter === u) setPlaying(false); };
+  state.speechUtter = u;
+  window.speechSynthesis.speak(u);
+  setPlaying(true);
+}
+
+/* =========================================================================
    Playback engine
    ========================================================================= */
 async function loadSegment(i, autoplay) {
   if (!state.doc) return;
   if (i < 0 || i >= state.doc.segments.length) { stopPlayback(); return; }
   if (!state.settings.voiceId) { toast('Pick a voice first.'); return; }
+  if (isDeviceVoice(state.settings.voiceId)) { speakSegment(i, autoplay); return; }
 
   clearWordHighlight();
   state.currentIndex = i;
@@ -621,19 +722,32 @@ async function loadSegment(i, autoplay) {
   setStatus('Generating…');
   el.playerStatus.classList.add('busy');
 
+  // On-device neural generation can be slow — show elapsed time so it never
+  // looks frozen.
+  let tick;
+  if (isKokoroVoice(state.settings.voiceId)) {
+    const t0 = Date.now();
+    tick = setInterval(() => setStatus(`Generating… ${Math.round((Date.now() - t0) / 1000)}s`), 1000);
+  }
+
   let out;
   try {
     out = await ensureAudio(i);
   } catch (err) {
+    clearInterval(tick);
     setStatus('');
     setPlaying(false);
     toast(err.message, 4200);
     return;
   }
+  clearInterval(tick);
   // If the user navigated away while we were synthesizing, bail.
   if (state.currentIndex !== i) return;
 
-  if (state.words[i] === null) buildWords(i, out.alignment);
+  const w0 = state.words[i];
+  if (w0 === null || (Array.isArray(w0) && w0.length && !('start' in w0[0]))) {
+    buildWords(i, out.alignment);
+  }
   audioEl.src = out.url;
   audioEl.playbackRate = state.settings.speed;
   setStatus(`Sentence ${i + 1} / ${state.doc.segments.length}`);
@@ -664,6 +778,16 @@ function setStatus(t) { el.playerStatus.textContent = t; if (!t) el.playerStatus
 
 function togglePlay() {
   if (!state.doc) return;
+  if (isDeviceVoice(state.settings.voiceId)) {
+    if (state.isPlaying) {
+      state.speechUtter = null;
+      window.speechSynthesis.cancel();
+      setPlaying(false);
+    } else {
+      speakSegment(state.currentIndex, true);
+    }
+    return;
+  }
   if (audioEl.src && !audioEl.ended && audioEl.currentTime > 0 && !state.isPlaying) {
     audioEl.play(); setPlaying(true); return;
   }
@@ -672,6 +796,7 @@ function togglePlay() {
 }
 function stopPlayback() {
   audioEl.pause();
+  if ('speechSynthesis' in window) { state.speechUtter = null; window.speechSynthesis.cancel(); }
   setPlaying(false);
   setStatus('Finished');
   clearWordHighlight();
@@ -729,8 +854,20 @@ function saveProgress(i) {
 function populateVoiceSelect(elevenStatus) {
   el.voiceSelect.innerHTML = '';
 
+  if (state.deviceVoices.length) {
+    const devGroup = document.createElement('optgroup');
+    devGroup.label = 'Free · instant (this device)';
+    for (const v of state.deviceVoices) {
+      const opt = document.createElement('option');
+      opt.value = 'device:' + v.voiceURI;
+      opt.textContent = `${v.name} (${v.lang})`;
+      devGroup.appendChild(opt);
+    }
+    el.voiceSelect.appendChild(devGroup);
+  }
+
   const freeGroup = document.createElement('optgroup');
-  freeGroup.label = 'Free · unlimited (on-device)';
+  freeGroup.label = 'Free · neural (slow on phones)';
   for (const v of KOKORO_VOICES) {
     const opt = document.createElement('option');
     opt.value = v.id;
@@ -757,11 +894,15 @@ function populateVoiceSelect(elevenStatus) {
   }
   el.voiceSelect.appendChild(elevenGroup);
 
-  // Default to a free voice; recover if the saved voice no longer exists.
-  if (!state.settings.voiceId) state.settings.voiceId = KOKORO_VOICES[0].id;
+  // Default to a free voice (device first — instant); recover if the saved
+  // voice no longer exists.
+  const fallback = state.deviceVoices.length
+    ? 'device:' + state.deviceVoices[0].voiceURI
+    : KOKORO_VOICES[0].id;
+  if (!state.settings.voiceId) state.settings.voiceId = fallback;
   el.voiceSelect.value = state.settings.voiceId;
   if (el.voiceSelect.value !== state.settings.voiceId) {
-    state.settings.voiceId = KOKORO_VOICES[0].id;
+    state.settings.voiceId = fallback;
     el.voiceSelect.value = state.settings.voiceId;
   }
   saveSettings();
@@ -847,6 +988,7 @@ function closeReader() {
 }
 function resetPlayer() {
   audioEl.pause();
+  if ('speechSynthesis' in window) { state.speechUtter = null; window.speechSynthesis.cancel(); }
   audioEl.removeAttribute('src');
   audioEl.load();
   setPlaying(false);
@@ -919,6 +1061,10 @@ function wireEvents() {
     state.settings.speed = parseFloat(el.speedSelect.value);
     audioEl.playbackRate = state.settings.speed;
     saveSettings();
+    // Device speech takes its rate at utterance start — re-speak to apply.
+    if (isDeviceVoice(state.settings.voiceId) && state.isPlaying) {
+      speakSegment(state.currentIndex, true);
+    }
   });
   el.voiceSelect.addEventListener('change', () => {
     state.settings.voiceId = el.voiceSelect.value;
@@ -982,13 +1128,13 @@ function wireEvents() {
 }
 
 function onVoiceOrModelChange() {
-  // New voice/model => different cached audio. Re-cue current sentence so the
-  // change is audible from where the user is (this will spend credits once).
+  // New voice/model => different audio. Re-cue current sentence so the change
+  // is audible from where the user is.
   if (!state.doc) return;
   const wasPlaying = state.isPlaying;
   audioEl.pause();
+  if ('speechSynthesis' in window) { state.speechUtter = null; window.speechSynthesis.cancel(); }
   setPlaying(false);
-  toast('Voice updated — new audio will be generated for what you play next.');
   loadSegment(state.currentIndex, wasPlaying);
 }
 
@@ -999,6 +1145,7 @@ async function init() {
   await loadSettings();
   wireEvents();
   await renderLibrary();
+  loadDeviceVoices();
   loadVoices();
   loadCredits();
 
