@@ -620,7 +620,7 @@ function loadDeviceVoices() {
   if (!('speechSynthesis' in window)) return;
   const collect = () => {
     const all = window.speechSynthesis.getVoices() || [];
-    if (!all.length) return;
+    if (!all.length) return false;
     let vs = all.filter((v) => /^en/i.test(v.lang));
     if (!vs.length) vs = all;
     // Enhanced/premium voices first — they sound noticeably better.
@@ -628,11 +628,26 @@ function loadDeviceVoices() {
       const rank = (v) => (/premium|enhanced/i.test(v.name + v.voiceURI) ? 0 : 1);
       return rank(a) - rank(b) || a.name.localeCompare(b.name);
     });
+    const changed = vs.length !== state.deviceVoices.length
+      || vs.some((v, k) => state.deviceVoices[k] && state.deviceVoices[k].voiceURI !== v.voiceURI)
+      || !state.deviceVoices.length;
     state.deviceVoices = vs;
-    populateVoiceSelect();
+    if (changed) populateVoiceSelect();
+    return true;
   };
+  // iOS Safari often returns an empty list until asked several times, and
+  // only fires voiceschanged unreliably — poll for a few seconds.
+  let tries = 0;
+  const poll = setInterval(() => {
+    tries++;
+    if (collect() || tries > 15) clearInterval(poll);
+  }, 300);
   collect();
   window.speechSynthesis.onvoiceschanged = collect;
+  // Newly downloaded system voices appear after returning from Settings.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') collect();
+  });
 }
 
 // Word spans with character ranges (no timings — boundary events drive these).
